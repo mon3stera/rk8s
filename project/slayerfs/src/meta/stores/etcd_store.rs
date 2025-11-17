@@ -703,6 +703,8 @@ impl EtcdMetaStore {
                     }
                     None => {
                         let (value, r) = init()?;
+                        // When a key doesn't exist, there is no mod_revision. However, the version of a non-existent key
+                        // is 0. So the following `compare` use `Compare::version`.
                         (value, r, 0)
                     }
                 };
@@ -823,7 +825,7 @@ impl EtcdMetaStore {
         self.atomic_update(
             &key,
             |dir: EtcdDirChildren| {
-                let mut children = dir.children.clone();
+                let mut children = dir.children;
                 updater(&mut children);
                 Ok((EtcdDirChildren::new(parent_ino, children), ()))
             },
@@ -1769,6 +1771,8 @@ impl MetaStore for EtcdMetaStore {
 
     async fn append_slice(&self, chunk_id: u64, slice: SliceDesc) -> Result<(), MetaError> {
         let key = key_for_slice(chunk_id);
+
+        // Note that `slice` is `Copy`.
         self.atomic_update(
             &key,
             |mut source: Vec<SliceDesc>| {
