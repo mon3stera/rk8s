@@ -13,44 +13,26 @@ use crate::meta::{INODE_ID_KEY, Permission};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::Utc;
-use dashmap::{DashMap, mapref::entry::Entry};
 use etcd_client::{Client as EtcdClient, Compare, CompareOp, Txn, TxnOp};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{error, info, warn};
+use crate::meta::stores::pool::IdPool;
 
 /// ID allocation batch size
 /// TODO: make configurable.
 const BATCH_SIZE: i64 = 1000;
 const FIRST_ALLOCATED_ID: i64 = 2;
 
-/// Local ID allocation pool
-///
-/// This structure maintains a range of pre-allocated IDs from etcd.
-/// Must be protected by a Mutex for thread-safe access, as multiple
-/// async tasks may attempt to allocate IDs concurrently.
-///
-/// The pool allocates BATCH_SIZE IDs from etcd at once and distributes
-/// them locally to reduce network round-trips.
-#[derive(Default)]
-struct IdPool {
-    /// Next ID to allocate from local pool
-    next: i64,
-    /// End of current pool range (exclusive)
-    end: i64,
-}
-
 /// Etcd-based metadata store
 pub struct EtcdMetaStore {
     client: EtcdClient,
     _config: Config,
     /// Local ID pools keyed by counter key (inode, slice, etc.)
-    id_pools: DashMap<String, Arc<Mutex<IdPool>>>,
+    id_pools: IdPool,
 }
 
 #[allow(dead_code)]
@@ -82,7 +64,7 @@ impl EtcdMetaStore {
         let store = Self {
             client,
             _config,
-            id_pools: DashMap::new(),
+            id_pools: IdPool::default(),
         };
         store.init_root_directory().await?;
 
@@ -98,7 +80,7 @@ impl EtcdMetaStore {
         let store = Self {
             client,
             _config,
-            id_pools: DashMap::new(),
+            id_pools: IdPool::default(),
         };
         store.init_root_directory().await?;
 
@@ -588,31 +570,7 @@ impl EtcdMetaStore {
     async fn generate_id(&self, counter_key: &str) -> Result<i64, MetaError> {
         let start = std::time::Instant::now();
 
-        let pool_mutex = match self.id_pools.entry(counter_key.to_string()) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => entry
-                .insert(Arc::new(Mutex::new(IdPool::default())))
-                .clone(),
-        };
-
-        // Acquire lock once and hold it through potential etcd allocation
-        // This prevents concurrent threads from all trying to refill simultaneously
-        let mut pool = pool_mutex.lock().await;
-
-        // Fast path: allocate from existing pool
-        if pool.next < pool.end {
-            let id = pool.next;
-            pool.next += 1;
-            let remaining = pool.end - pool.next;
-
-            info!(
-                counter_key = counter_key,
-                allocated_id = id,
-                pool_hit = true,
-                pool_remaining = remaining,
-                "ID allocated from pool (fast path)"
-            );
-
+        if let Some(id) = self.id_pools.try_alloc(counter_key).await {
             return Ok(id);
         }
 
@@ -645,15 +603,14 @@ impl EtcdMetaStore {
             )
             .await?;
 
-        pool.next = next_start;
-        pool.end = pool_end;
+        self.id_pools.update(counter_key, next_start, pool_end).await;
 
         let elapsed = start.elapsed();
         info!(
             counter_key = counter_key,
             allocated_id = allocated_id,
             batch_size = BATCH_SIZE,
-            pool_remaining = pool.end - pool.next,
+            pool_remaining = next_start - pool_end,
             etcd_latency_ms = elapsed.as_millis() as u64,
             "ID batch allocated from etcd"
         );
@@ -1796,6 +1753,7 @@ impl MetaStore for EtcdMetaStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
     use crate::chuck::SliceDesc;
     use crate::meta::config::{CacheConfig, ClientOptions, Config, DatabaseConfig, DatabaseType};
@@ -1946,6 +1904,11 @@ mod tests {
 
         let unique: HashSet<_> = ids.iter().cloned().collect();
         assert_eq!(unique.len(), ids_per_task * 4);
-        println!("{unique:#?}")
+
+        let mut unique = unique.into_iter().collect::<Vec<_>>();
+        unique.sort();
+
+        let should = (2..=4001).into_iter().collect::<Vec<_>>();
+        assert_eq!(unique, should);
     }
 }
