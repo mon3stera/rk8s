@@ -9,6 +9,7 @@ use crate::meta::config::{Config, DatabaseType};
 use crate::meta::entities::etcd::*;
 use crate::meta::entities::*;
 use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
+use crate::meta::stores::pool::IdPool;
 use crate::meta::{INODE_ID_KEY, Permission};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
@@ -20,7 +21,6 @@ use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{error, info, warn};
-use crate::meta::stores::pool::IdPool;
 
 /// ID allocation batch size
 /// TODO: make configurable.
@@ -603,7 +603,9 @@ impl EtcdMetaStore {
             )
             .await?;
 
-        self.id_pools.update(counter_key, next_start, pool_end).await;
+        self.id_pools
+            .update(counter_key, next_start, pool_end)
+            .await;
 
         let elapsed = start.elapsed();
         info!(
@@ -1753,12 +1755,12 @@ impl MetaStore for EtcdMetaStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
     use crate::chuck::SliceDesc;
     use crate::meta::config::{CacheConfig, ClientOptions, Config, DatabaseConfig, DatabaseType};
     use crate::meta::entities::etcd::{EtcdDirChildren, EtcdEntryInfo};
     use crate::meta::{INODE_ID_KEY, Permission};
+    use std::sync::Arc;
 
     fn test_config() -> Config {
         Config {

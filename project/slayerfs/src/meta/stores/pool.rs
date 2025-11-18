@@ -1,6 +1,4 @@
 use dashmap::DashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::info;
 
 /// Local ID allocation pool
@@ -8,21 +6,19 @@ use tracing::info;
 /// This structure maintains each pool of a specific counter_key.
 #[derive(Default)]
 pub struct IdPool {
-    inner: DashMap<String, Arc<Mutex<IdPoolInner>>>,
+    inner: DashMap<String, IdPoolInner>,
 }
 
 impl IdPool {
     /// Try allocating an id from the pool of `counter_key`.
     pub async fn try_alloc(&self, counter_key: impl AsRef<str>) -> Option<i64> {
         let counter_key = counter_key.as_ref();
-        let entry= self
-            .inner
-            .entry(counter_key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(IdPoolInner::default())));
 
-        let mu = entry.value();
+        // Notice that the entry api will lock current thread, but it's ok there because we will not
+        // hold it for a long time or cross the await boundary.
+        let mut entry = self.inner.entry(counter_key.to_string()).or_default();
 
-        let mut pool = mu.lock().await;
+        let pool = entry.value_mut();
         if pool.next < pool.end {
             let id = pool.next;
             pool.next += 1;
@@ -44,13 +40,11 @@ impl IdPool {
     /// Update the new `next` and `end` of the pool of `counter_key`
     pub async fn update(&self, counter_key: impl AsRef<str>, next: i64, end: i64) {
         let counter_key = counter_key.as_ref();
-        let entry= self
-            .inner
-            .entry(counter_key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(IdPoolInner::default())));
 
-        let mu = entry.value();
-        let mut pool = mu.lock().await;
+        // if everything is ok, there must be an occupied entry.
+        let mut entry = self.inner.entry(counter_key.to_string()).or_default();
+
+        let pool = entry.value_mut();
         pool.next = next;
         pool.end = end;
     }
