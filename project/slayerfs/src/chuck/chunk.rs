@@ -69,6 +69,12 @@ impl ChunkLayout {
         (offset_in_chunk / self.block_size as u64) as u32
     }
 
+    #[inline]
+    #[allow(dead_code)]
+    pub fn within_block_offset(&self, offset_in_chunk: u64) -> u32 {
+        (offset_in_chunk % self.block_size as u64) as u32
+    }
+
     /// Return the file byte range [start, end) covered by a chunk index (end exclusive).
     #[inline]
     #[allow(dead_code)]
