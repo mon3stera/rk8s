@@ -55,7 +55,10 @@ impl<T: SpanTag> Span<T> {
             my_align >= target_align,
             "Parent alignment must be >= child alignment"
         );
-        debug_assert!(my_align % target_align == 0, "Alignments must be divisible");
+        debug_assert!(
+            my_align.is_multiple_of(target_align),
+            "Alignments must be divisible"
+        );
 
         // Calculate the absolute linear start position
         let start_abs = self.index * my_align + self.offset as u64;
