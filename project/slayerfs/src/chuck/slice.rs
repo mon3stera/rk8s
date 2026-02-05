@@ -49,6 +49,12 @@ pub struct SliceDesc {
     pub length: u64,
 }
 
+impl SliceDesc {
+    pub(crate) fn range(&self) -> (u64, u64) {
+        (self.offset, self.offset + self.length)
+    }
+}
+
 pub fn block_span_iter(desc: SliceDesc, layout: ChunkLayout) -> impl Iterator<Item = BlockSpan> {
     let chunk_span = Span::<ChunkTag>::new(0, desc.offset, desc.length);
     chunk_span.split_into::<BlockTag>(layout.chunk_size, layout.block_size as u64, true)

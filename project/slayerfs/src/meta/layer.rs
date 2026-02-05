@@ -222,6 +222,8 @@ pub trait MetaLayer: Send + Sync {
 
     async fn next_id(&self, key: &str) -> Result<i64, MetaError>;
 
+    async fn compact_chunk(&self, ino: i64, chunk_id: u64, sync: bool) -> Result<(), MetaError>;
+
     // ---------- Session lifecycle ----------
     async fn start_session(&self, session_info: SessionInfo) -> Result<(), MetaError>;
 
@@ -249,10 +251,15 @@ pub trait MetaLayer: Send + Sync {
         value: &[u8],
         flags: u32,
     ) -> Result<(), MetaError>;
+
     async fn get_xattr(&self, inode: i64, name: &str) -> Result<Option<Vec<u8>>, MetaError>;
+
     async fn list_xattr(&self, inode: i64) -> Result<Vec<String>, MetaError>;
+
     async fn remove_xattr(&self, inode: i64, name: &str) -> Result<(), MetaError>;
+
     async fn set_acl(&self, inode: i64, rule: AclRule) -> Result<(), MetaError>;
+
     async fn get_acl(
         &self,
         inode: i64,

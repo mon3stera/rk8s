@@ -818,18 +818,12 @@ pub trait MetaStore: Send + Sync {
     async fn compact_chunk(
         &self,
         inode: i64,
-        index: u32,
-        origin: &[u8],
-        slices: &[SliceDesc],
-        skipped: i32,
-        pos: u32,
-        id: u64,
-        size: u32,
-        delayed: &[u8],
+        chunk_id: u64,
+        origin: &[SliceDesc],
+        new: SliceDesc,
+        skipped: usize,
     ) -> Result<(), MetaError> {
-        let _ = (
-            inode, index, origin, slices, skipped, pos, id, size, delayed,
-        );
+        let _ = (inode, chunk_id, origin, new, skipped);
         Err(MetaError::NotImplemented)
     }
     // ---------- File lock ----------

@@ -14,7 +14,9 @@
 //!
 pub(crate) mod backoff;
 pub mod client;
+mod compact;
 pub mod config;
+mod data;
 pub(crate) mod entities;
 pub mod factory;
 pub mod file_lock;

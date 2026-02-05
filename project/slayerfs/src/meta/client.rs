@@ -27,6 +27,8 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{Instrument, debug, info, trace, warn};
 use uuid::Uuid;
 
+use crate::meta::SLICE_ID_KEY;
+use crate::meta::compact::{skip_slices, split_slices};
 use crate::vfs::extract_ino_and_chunk_index;
 use cache::InodeCache;
 use chrono::Utc;
@@ -1820,6 +1822,31 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     async fn next_id(&self, key: &str) -> Result<i64, MetaError> {
         self.ensure_writable()?;
         self.store.next_id(key).await
+    }
+
+    async fn compact_chunk(&self, ino: i64, chunk_id: u64, sync: bool) -> Result<(), MetaError> {
+        let store = self.store.clone();
+        let op = self.data_op.clone();
+
+        let compact_fn = move || async {
+            let slices = store.get_slices(chunk_id).await?;
+
+            let (skipped, split) = skip_slices(&slices);
+            if split.is_empty() {
+                return Ok(());
+            }
+
+            let id = store.next_id(SLICE_ID_KEY).await? as u64;
+            let compacted = op.write_compacted_slice(id, &split).await?;
+            store
+                .compact_chunk(ino, chunk_id, &slices, compacted, skipped)
+                .await?;
+
+            Ok(())
+        };
+
+        let handle = tokio::spawn(compact_fn);
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(pid = session_info.process_id))]
