@@ -28,13 +28,16 @@ use tracing::{Instrument, debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::meta::SLICE_ID_KEY;
-use crate::meta::compact::{skip_slices, split_slices};
+use crate::meta::background::{BackgroundTasks, DeleteTask};
+use crate::meta::compact::skip_slices;
+use crate::meta::data::{NoopData, WithData};
 use crate::vfs::extract_ino_and_chunk_index;
 use cache::InodeCache;
 use chrono::Utc;
 use hostname::get as get_hostname;
 use path_trie::PathTrie;
 use session::{SessionInfo, SessionManager};
+use tokio::select;
 
 const ROOT_INODE: i64 = 1;
 
@@ -49,10 +52,13 @@ pub struct MetaClientOptions {
     pub mount_point: Option<String>,
     /// Interval used by the background session heartbeat task.
     pub session_heartbeat: Duration,
+    pub cleanup_scan_duration: Duration,
     /// When true, metadata mutating operations return `MetaError::NotSupported`.
     pub read_only: bool,
     /// Disable background maintenance tasks (reserved for future use).
     pub no_background_jobs: bool,
+    /// Max number of worker for deleting.
+    pub max_delete_worker: usize,
     /// When true, lookups fall back to case-insensitive matching similar to
     /// JuiceFS `CaseInsensi`.
     pub case_insensitive: bool,
@@ -127,8 +133,10 @@ impl Default for MetaClientOptions {
         Self {
             mount_point: None,
             session_heartbeat: DEFAULT_SESSION_HEARTBEAT,
+            cleanup_scan_duration: DEFAULT_CLEANUP_SCAN_DURATION,
             read_only: false,
             no_background_jobs: false,
+            max_delete_worker: 2,
             case_insensitive: false,
             max_symlinks: 40,
             batch_prefetch: BatchPrefetchConfig::default(),
@@ -137,14 +145,18 @@ impl Default for MetaClientOptions {
 }
 const DEFAULT_SESSION_HEARTBEAT: Duration = Duration::from_secs(30);
 
+const DEFAULT_CLEANUP_SCAN_DURATION: Duration = Duration::from_hours(1);
+
 /// Metadata client with intelligent caching
 ///
 /// This client wraps a MetaStore and provides transparent caching for:
 /// - Inode attributes (file metadata)
 /// - Directory children (directory listings)
 /// - Path-to-inode mappings (path resolution)
-pub struct MetaClient<T: MetaStore> {
+pub struct MetaClient<T: MetaStore, D: WithData = NoopData> {
     store: Arc<T>,
+    data_op: Arc<D>,
+    background: BackgroundTasks,
     options: MetaClientOptions,
     root: AtomicI64,
     #[allow(dead_code)]
@@ -172,7 +184,64 @@ pub struct MetaClient<T: MetaStore> {
     watch_worker: Option<Arc<EtcdWatchWorker>>,
 }
 
-impl<T: MetaStore + 'static> MetaClient<T> {
+pub struct MetaClientBuilder<T, D>
+where
+    T: MetaStore + Send + Sync + 'static,
+    D: WithData + Send + Sync + 'static,
+{
+    store: Arc<T>,
+    data_op: Arc<D>,
+    capacity: CacheCapacity,
+    ttl: CacheTtl,
+    options: MetaClientOptions,
+}
+
+impl<T, D> MetaClientBuilder<T, D>
+where
+    T: MetaStore + Send + Sync + 'static,
+    D: WithData + Send + Sync + 'static,
+{
+    pub fn new(store: Arc<T>, data_op: Arc<D>) -> Self {
+        Self {
+            store,
+            data_op,
+            capacity: CacheCapacity::default(),
+            ttl: CacheTtl::default(),
+            options: MetaClientOptions::default(),
+        }
+    }
+
+    pub fn with_cache(mut self, capacity: CacheCapacity, ttl: CacheTtl) -> Self {
+        self.capacity = capacity;
+        self.ttl = ttl;
+        self
+    }
+
+    pub fn with_options(mut self, options: MetaClientOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    pub fn build(self) -> Arc<MetaClient<T, D>> {
+        MetaClient::with_options(
+            self.store,
+            self.data_op,
+            self.capacity,
+            self.ttl,
+            self.options,
+        )
+    }
+}
+
+impl<T, D> MetaClient<T, D>
+where
+    T: MetaStore + Send + Sync + 'static,
+    D: WithData + Send + Sync + 'static,
+{
+    pub fn builder(store: Arc<T>, data_op: Arc<D>) -> MetaClientBuilder<T, D> {
+        MetaClientBuilder::new(store, data_op)
+    }
+
     /// Creates a new MetaClient with cache configuration.
     ///
     /// # Arguments
@@ -185,14 +254,20 @@ impl<T: MetaStore + 'static> MetaClient<T> {
     ///
     /// A new `MetaClient` instance with initialized caches
     #[allow(dead_code)]
-    pub fn new(store: Arc<T>, capacity: CacheCapacity, ttl: CacheTtl) -> Arc<Self> {
-        Self::with_options(store, capacity, ttl, MetaClientOptions::default())
+    pub fn new(
+        store: Arc<T>,
+        data_op: Arc<D>,
+        capacity: CacheCapacity,
+        ttl: CacheTtl,
+    ) -> Arc<Self> {
+        Self::with_options(store, data_op, capacity, ttl, MetaClientOptions::default())
     }
 
     /// Creates a new `MetaClient` with cache configuration and additional
     /// behavioural options ported from the JuiceFS `baseMeta` implementation.
     pub fn with_options(
         store: Arc<T>,
+        data_op: Arc<D>,
         capacity: CacheCapacity,
         ttl: CacheTtl,
         mut options: MetaClientOptions,
@@ -240,6 +315,8 @@ impl<T: MetaStore + 'static> MetaClient<T> {
         // Create MetaClient
         let client = Arc::new(Self {
             store: store.clone(),
+            data_op,
+            background: BackgroundTasks::new(),
             options,
             root: AtomicI64::new(root_ino),
             umounting: AtomicBool::new(false),
@@ -314,12 +391,72 @@ impl<T: MetaStore + 'static> MetaClient<T> {
 
     fn ensure_background_jobs(&self) -> Result<(), MetaError> {
         if self.options.no_background_jobs {
-            Err(MetaError::NotSupported(
+            return Err(MetaError::NotSupported(
                 "background jobs disabled".to_string(),
-            ))
-        } else {
-            Ok(())
+            ));
         }
+
+        self.start_delete_background();
+        self.start_cleanup_slice_background();
+        Ok(())
+    }
+
+    fn start_cleanup_slice_background(&self) {
+        let duration = self.options.cleanup_scan_duration;
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(duration);
+
+            loop {
+                ticker.tick().await;
+            }
+        });
+    }
+
+    fn start_delete_background(&self) {
+        let mut delete = self.background.delete.lock();
+
+        if delete.sender.is_some() {
+            return;
+        }
+
+        let (sender, receiver) = async_channel::bounded::<Vec<SliceDesc>>(1024);
+
+        let cancel = delete.cancel.clone();
+
+        for _ in 0..self.options.max_delete_worker {
+            let store = self.store.clone();
+            let op = self.data_op.clone();
+
+            let receiver = receiver.clone();
+
+            let cancel_cloned = cancel.clone();
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    select! {
+                        _ = cancel_cloned.cancelled() => break,
+
+                        result = receiver.recv() => {
+                            if let Ok(slices) = result {
+                                match op.delete_slices(&slices).await {
+                                    Ok(_) => {
+                                        if let Err(e) = store.delete_slices(&slices).await {
+                                            tracing::error!("Failed to delete slices: {e}");
+                                        }
+                                    }
+                                    Err(e) => tracing::error!("Failed to delete objects: {e}"),
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            delete.tasks.push(DeleteTask { handle });
+        }
+
+        delete.sender = Some(sender);
     }
 
     fn mark_umounting(&self) {
@@ -969,7 +1106,11 @@ impl<T: MetaStore + 'static> MetaClient<T> {
 
 #[async_trait]
 #[allow(dead_code)]
-impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
+impl<T, D> MetaLayer for MetaClient<T, D>
+where
+    T: MetaStore + Send + Sync + 'static,
+    D: WithData + Send + Sync + 'static,
+{
     fn name(&self) -> &'static str {
         self.store.name()
     }
@@ -1028,6 +1169,16 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
             .ok_or(MetaError::NotFound(ino))?;
 
         Ok(Some((ino, attr.kind)))
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(path))]
+    async fn resolve_path(&self, path: &str) -> Result<i64, MetaError> {
+        MetaClient::resolve_path(self, path).await
+    }
+
+    #[tracing::instrument(level = "trace", skip(self), fields(path))]
+    async fn resolve_path_follow(&self, path: &str) -> Result<i64, MetaError> {
+        MetaClient::resolve_path_follow(self, path).await
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(path))]
@@ -1825,27 +1976,81 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     }
 
     async fn compact_chunk(&self, ino: i64, chunk_id: u64, sync: bool) -> Result<(), MetaError> {
+        self.ensure_background_jobs()?;
+
+        let sender = {
+            let delete = self.background.delete.lock();
+            delete.sender.clone().ok_or_else(|| {
+                MetaError::Internal(
+                    "Failed to compact chunk because the background delete task isn't running"
+                        .to_string(),
+                )
+            })?
+        };
+
         let store = self.store.clone();
         let op = self.data_op.clone();
 
-        let compact_fn = move || async {
+        let handle: tokio::task::JoinHandle<Result<(), MetaError>> = tokio::spawn(async move {
             let slices = store.get_slices(chunk_id).await?;
 
-            let (skipped, split) = skip_slices(&slices);
-            if split.is_empty() {
+            let (old, offset, length, skipped) = skip_slices(&slices);
+            if old.is_empty() {
                 return Ok(());
             }
 
             let id = store.next_id(SLICE_ID_KEY).await? as u64;
-            let compacted = op.write_compacted_slice(id, &split).await?;
-            store
+            let compacted = op.write_compact_slice(id, offset, length, &old).await?;
+            let to_delete = store
                 .compact_chunk(ino, chunk_id, &slices, compacted, skipped)
                 .await?;
 
+            if to_delete.is_empty() {
+                return Ok(());
+            }
+
+            sender.send(to_delete).await.map_err(|e| {
+                MetaError::Internal(format!("Failed to enqueue delete slices: {e}"))
+            })?;
+
             Ok(())
+        });
+
+        if sync {
+            handle.await.map_err(|e| {
+                MetaError::Internal(format!("Failed to wait for compact_chunk done: {e}"))
+            })??;
+        }
+        Ok(())
+    }
+
+    async fn delete_slices(&self, slices: &[SliceDesc]) -> Result<(), MetaError> {
+        if slices.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_background_jobs()?;
+
+        let sender = {
+            let delete = self.background.delete.lock();
+            if delete.cancel.is_cancelled() {
+                return Err(MetaError::Internal(
+                    "Delete Background has been cancelled".to_string(),
+                ));
+            }
+
+            delete.sender.clone().ok_or_else(|| {
+                MetaError::Internal(
+                    "Failed to delete slices because the background delete task isn't running"
+                        .to_string(),
+                )
+            })?
         };
 
-        let handle = tokio::spawn(compact_fn);
+        sender.send(slices.to_vec()).await.map_err(|e| {
+            MetaError::Internal(format!("Receiver has been closed unexpectedly: {e}"))
+        })?;
+
         Ok(())
     }
 
@@ -1965,7 +2170,7 @@ mod tests {
             path_ttl: Duration::from_secs(60),
         };
 
-        MetaClient::new(store, capacity, ttl)
+        MetaClient::new(store, Arc::new(NoopData), capacity, ttl)
     }
 
     #[tokio::test]

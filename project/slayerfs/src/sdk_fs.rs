@@ -361,7 +361,7 @@ impl Client {
 impl<S, M> ClientBackend for crate::vfs::sdk::VfsClient<S, M>
 where
     S: crate::chuck::store::BlockStore + Send + Sync + 'static,
-    M: crate::meta::MetaStore + Send + Sync + 'static,
+    M: crate::meta::MetaLayer + Send + Sync + 'static,
 {
     async fn mkdir(&self, path: &str) -> io::Result<()> {
         self.mkdir(path).await

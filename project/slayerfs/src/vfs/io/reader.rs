@@ -340,8 +340,10 @@ impl SliceState {
                 }
             };
             let f = || async {
-                let mut fetcher = DataFetcher::new(layout, chunk_id, &backend);
-                fetcher.prepare_slices().await?;
+                let slices = backend.meta().get_slices(chunk_id).await?;
+                let mut fetcher = DataFetcher::new(layout, chunk_id, backend.store());
+
+                fetcher.prepare_slices(slices).await;
 
                 let out = fetcher.read_at(start, (end - start).as_usize()).await?;
                 Ok::<_, anyhow::Error>(out)
@@ -1034,7 +1036,7 @@ mod tests {
         let tail = &data[512..];
 
         let slice_id1 = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
-        let uploader = DataUploader::new(layout, chunk_id_for(ino, 0).unwrap(), backend.as_ref());
+        let uploader = DataUploader::new(layout, chunk_id_for(ino, 0).unwrap(), backend.store());
         let desc1 = uploader
             .write_at_vectored(
                 slice_id1 as u64,
@@ -1049,7 +1051,7 @@ mod tests {
             .unwrap();
 
         let slice_id2 = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
-        let uploader = DataUploader::new(layout, chunk_id_for(ino, 1).unwrap(), backend.as_ref());
+        let uploader = DataUploader::new(layout, chunk_id_for(ino, 1).unwrap(), backend.store());
         let desc2 = uploader
             .write_at_vectored(slice_id2 as u64, 0, &[Bytes::copy_from_slice(tail)])
             .await
@@ -1083,7 +1085,7 @@ mod tests {
         let data2 = vec![2u8; 2048];
 
         let slice_id1 = meta_store.next_id(SLICE_ID_KEY).await.unwrap();
-        let uploader = DataUploader::new(layout, chunk_id_for(ino, 0).unwrap(), backend.as_ref());
+        let uploader = DataUploader::new(layout, chunk_id_for(ino, 0).unwrap(), backend.store());
         let desc1 = uploader
             .write_at_vectored(slice_id1 as u64, 0, &[Bytes::copy_from_slice(&data1)])
             .await

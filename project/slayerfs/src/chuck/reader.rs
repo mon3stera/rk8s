@@ -3,57 +3,39 @@
 use super::chunk::ChunkLayout;
 use super::slice::{SliceDesc, block_span_iter};
 use super::store::BlockStore;
-use crate::meta::MetaLayer;
 use crate::utils::Intervals;
 use crate::utils::NumCastExt;
-use crate::vfs::backend::Backend;
 use anyhow::{Result, ensure};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use std::cmp::{max, min};
 use tracing::Instrument;
 
-pub(crate) struct DataFetcher<'a, B, M> {
+pub(crate) struct DataFetcher<'a, B> {
     layout: ChunkLayout,
     id: u64,
     slices: Vec<SliceDesc>,
     prepared: bool,
-    backend: &'a Backend<B, M>,
+    store: &'a B,
 }
 
-impl<'a, B, M> DataFetcher<'a, B, M>
+impl<'a, B> DataFetcher<'a, B>
 where
     B: BlockStore,
-    M: MetaLayer,
 {
-    pub(crate) fn new(layout: ChunkLayout, id: u64, backend: &'a Backend<B, M>) -> Self {
+    pub(crate) fn new(layout: ChunkLayout, id: u64, store: &'a B) -> Self {
         Self {
             layout,
             id,
-            backend,
             prepared: false,
             slices: Vec::new(),
+            store,
         }
     }
 
-    pub(crate) async fn prepare_slices(&mut self) -> Result<()> {
-        let chunk_id = self.id;
-        let backend = self.backend;
-        let slices = async {
-            let slices = backend.meta().get_slices(chunk_id).await?;
-            tracing::Span::current().record("slice_count", slices.len());
-            Ok::<_, anyhow::Error>(slices)
-        }
-        .instrument(tracing::trace_span!(
-            "fetch.prepare_slices",
-            chunk_id,
-            slice_count = tracing::field::Empty
-        ))
-        .await?;
-
+    pub(crate) async fn prepare_slices(&mut self, slices: Vec<SliceDesc>) {
         self.slices = slices;
         self.prepared = true;
-        Ok(())
     }
 
     #[tracing::instrument(
@@ -90,7 +72,7 @@ where
         tracing::Span::current().record("need_reads", need_read.len());
 
         let layout = self.layout;
-        let backend = self.backend;
+        let store = self.store;
 
         {
             let mut cursor = 0;
@@ -127,16 +109,17 @@ where
                     async move {
                         let mut pos = 0_usize;
                         let mut blocks = 0usize;
+
                         for span in block_span_iter(desc, layout) {
                             blocks += 1;
                             let take = span.len.as_usize();
                             let out = &mut seg[pos..pos + take];
-                            backend
-                                .store()
+                            store
                                 .read_range((desc.slice_id, span.index.as_u32()), span.offset, out)
                                 .await?;
                             pos += take;
                         }
+
                         tracing::Span::current().record("blocks", blocks);
                         Ok::<_, anyhow::Error>(())
                     }
@@ -157,9 +140,8 @@ mod tests {
     use super::*;
     use crate::chuck::store::InMemoryBlockStore;
     use crate::chuck::writer::DataUploader;
-    use crate::meta::SLICE_ID_KEY;
     use crate::meta::factory::create_meta_store_from_url;
-    use crate::vfs::backend::Backend;
+    use crate::meta::{MetaLayer, SLICE_ID_KEY};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -170,12 +152,11 @@ mod tests {
             .await
             .unwrap()
             .layer();
-        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
         // Only write the first half of the second block
         {
             let buf = vec![1u8; (layout.block_size / 2) as usize];
             let slice_id = meta.next_id(SLICE_ID_KEY).await.unwrap();
-            let uploader = DataUploader::new(layout, 7, backend.as_ref());
+            let uploader = DataUploader::new(layout, 7, store.as_ref());
             let desc = uploader
                 .write_at_vectored(
                     slice_id as u64,
@@ -186,8 +167,9 @@ mod tests {
                 .unwrap();
             meta.append_slice(7, desc).await.unwrap();
         }
-        let mut r = DataFetcher::new(layout, 7, backend.as_ref());
-        r.prepare_slices().await.unwrap();
+        let slices = meta.get_slices(7).await.unwrap();
+        let mut r = DataFetcher::new(layout, 7, store.as_ref());
+        r.prepare_slices(slices).await;
         // Read from the back half of block 0 to the front half of block 1 (one block total)
         let off = layout.block_size as u64 / 2;
         let res = r.read_at(off, layout.block_size as usize).await.unwrap();
@@ -216,12 +198,11 @@ mod tests {
             .await
             .unwrap()
             .layer();
-        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
 
         let offset = layout.block_size as u64 - 512;
         let data = vec![7u8; 2048];
         let slice_id = meta.next_id(SLICE_ID_KEY).await.unwrap();
-        let uploader = DataUploader::new(layout, 3, backend.as_ref());
+        let uploader = DataUploader::new(layout, 3, store.as_ref());
         let desc = uploader
             .write_at_vectored(
                 slice_id as u64,
@@ -232,8 +213,9 @@ mod tests {
             .unwrap();
         meta.append_slice(3, desc).await.unwrap();
 
-        let mut fetcher = DataFetcher::new(layout, 3, backend.as_ref());
-        fetcher.prepare_slices().await.unwrap();
+        let slices = meta.get_slices(3).await.unwrap();
+        let mut fetcher = DataFetcher::new(layout, 3, store.as_ref());
+        fetcher.prepare_slices(slices).await;
         let out = fetcher.read_at(offset, data.len()).await.unwrap();
         assert_eq!(out, data);
     }
@@ -249,13 +231,12 @@ mod tests {
             .await
             .unwrap()
             .layer();
-        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
 
         let data1 = vec![1u8; 2048];
         let data2 = vec![2u8; 2048];
 
         let slice_id1 = meta.next_id(SLICE_ID_KEY).await.unwrap();
-        let uploader = DataUploader::new(layout, 9, backend.as_ref());
+        let uploader = DataUploader::new(layout, 9, store.as_ref());
         let desc1 = uploader
             .write_at_vectored(
                 slice_id1 as u64,
@@ -277,8 +258,9 @@ mod tests {
             .unwrap();
         meta.append_slice(9, desc2).await.unwrap();
 
-        let mut fetcher = DataFetcher::new(layout, 9, backend.as_ref());
-        fetcher.prepare_slices().await.unwrap();
+        let slices = meta.get_slices(9).await.unwrap();
+        let mut fetcher = DataFetcher::new(layout, 9, store.as_ref());
+        fetcher.prepare_slices(slices).await;
         let out = fetcher.read_at(0, 3072).await.unwrap();
         assert_eq!(&out[..1024], &data1[..1024]);
         assert_eq!(&out[1024..], &data2[..]);

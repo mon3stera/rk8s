@@ -11,7 +11,6 @@
 
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
-use crate::meta::MetaStore;
 use crate::meta::client::MetaClient;
 use crate::meta::config::MetaClientConfig;
 use crate::meta::layer::MetaLayer;
@@ -19,6 +18,7 @@ use crate::meta::permission::Permission;
 use crate::meta::store::{
     DirEntry, FileAttr, FileType, MetaError, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
 };
+use crate::meta::{MetaStore, WithDataFn};
 use crate::vfs::fs::VFS;
 use libc::{getegid, geteuid, getgroups};
 use std::io;
@@ -402,9 +402,9 @@ fn meta_error_to_io(path: &str, err: MetaError) -> io::Error {
 pub struct FileSystem<S, M>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + 'static,
+    M: MetaLayer + Send + Sync + 'static,
 {
-    vfs: VFS<S, MetaClient<M>>,
+    vfs: VFS<S, M>,
     config: FileSystemConfig,
     access_log_tx: Option<mpsc::Sender<AccessLogEntry>>,
     next_file_id: AtomicU64,
@@ -418,13 +418,13 @@ bitflags::bitflags! {
     }
 }
 
-impl<S, M> FileSystem<S, M>
+impl<S, R> FileSystem<S, MetaClient<R, WithDataFn>>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + 'static,
+    R: MetaStore + Send + Sync + 'static,
 {
     /// Create a new FileSystem with default meta/client configuration.
-    pub async fn new(layout: ChunkLayout, store: S, meta: M) -> io::Result<Self> {
+    pub async fn new(layout: ChunkLayout, store: S, meta: R) -> io::Result<Self> {
         Self::with_configs(
             layout,
             store,
@@ -439,7 +439,7 @@ where
     pub async fn with_config(
         layout: ChunkLayout,
         store: S,
-        meta: M,
+        meta: R,
         config: FileSystemConfig,
     ) -> io::Result<Self> {
         Self::with_configs(layout, store, meta, MetaClientConfig::default(), config).await
@@ -449,7 +449,7 @@ where
     pub async fn with_meta_client_config(
         layout: ChunkLayout,
         store: S,
-        meta: M,
+        meta: R,
         meta_config: MetaClientConfig,
     ) -> io::Result<Self> {
         Self::with_configs(
@@ -465,35 +465,41 @@ where
     async fn with_configs(
         layout: ChunkLayout,
         store: S,
-        meta: M,
+        meta: R,
         meta_config: MetaClientConfig,
         config: FileSystemConfig,
     ) -> io::Result<Self> {
         let store = Arc::new(store);
         let meta = Arc::new(meta);
-        let meta_client = MetaClient::with_options(
-            Arc::clone(&meta),
-            meta_config.capacity.clone(),
-            meta_config.effective_ttl(),
-            meta_config.options.clone(),
-        );
+
+        let data_op = crate::meta::default_data_op(layout, Arc::clone(&store));
+        let meta_client = MetaClient::builder(Arc::clone(&meta), data_op)
+            .with_cache(meta_config.capacity.clone(), meta_config.effective_ttl())
+            .with_options(meta_config.options.clone())
+            .build();
+
         meta_client
             .initialize()
             .await
             .map_err(|e| io::Error::other(format!("meta init failed: {e}")))?;
-        Self::from_components(layout, store, meta, meta_client, config)
-    }
 
+        Self::from_components(layout, store, meta_client, config)
+    }
+}
+
+impl<S, M> FileSystem<S, M>
+where
+    S: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
     /// Create a new FileSystem from components and an existing meta layer.
     pub fn from_components(
         layout: ChunkLayout,
         store: Arc<S>,
-        meta: Arc<M>,
-        meta_layer: Arc<MetaClient<M>>,
+        meta_layer: Arc<M>,
         config: FileSystemConfig,
     ) -> io::Result<Self> {
         let access_log_tx = access_log_sender(&config);
-        let _ = meta;
         let vfs = VFS::with_meta_layer(layout, Arc::clone(&store), Arc::clone(&meta_layer))
             .map_err(std::io::Error::from)?;
         Ok(Self {
@@ -504,7 +510,7 @@ where
         })
     }
 
-    fn meta_layer(&self) -> &MetaClient<M> {
+    fn meta_layer(&self) -> &M {
         self.vfs.meta_layer()
     }
 
@@ -1671,7 +1677,7 @@ where
 }
 
 async fn read_inode<S, M>(
-    vfs: &VFS<S, MetaClient<M>>,
+    vfs: &VFS<S, M>,
     ino: i64,
     attr: FileAttr,
     offset: u64,
@@ -1680,7 +1686,7 @@ async fn read_inode<S, M>(
 ) -> io::Result<Vec<u8>>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + 'static,
+    M: MetaLayer + Send + Sync + 'static,
 {
     if len == 0 {
         return Ok(Vec::new());
@@ -1701,7 +1707,7 @@ where
 }
 
 async fn write_inode<S, M>(
-    vfs: &VFS<S, MetaClient<M>>,
+    vfs: &VFS<S, M>,
     ino: i64,
     attr: FileAttr,
     offset: u64,
@@ -1710,7 +1716,7 @@ async fn write_inode<S, M>(
 ) -> io::Result<usize>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + 'static,
+    M: MetaLayer + Send + Sync + 'static,
 {
     match attr.kind {
         FileType::File => {}
@@ -1734,7 +1740,7 @@ where
 pub struct File<S, M>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + 'static,
+    M: MetaLayer + Send + Sync + 'static,
 {
     id: u64,
     path: String,
@@ -1743,16 +1749,16 @@ where
     info: FileStat,
     flags: OpenFlags,
     offset: AtomicU64,
-    vfs: VFS<S, MetaClient<M>>,
+    vfs: VFS<S, M>,
     access_log_tx: Option<mpsc::Sender<AccessLogEntry>>,
 }
 
 impl<S, M> File<S, M>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + 'static,
+    M: MetaLayer + Send + Sync + 'static,
 {
-    fn meta_layer(&self) -> &MetaClient<M> {
+    fn meta_layer(&self) -> &M {
         self.vfs.meta_layer()
     }
 
@@ -2008,17 +2014,17 @@ where
 impl<S, M> Drop for File<S, M>
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + 'static,
+    M: MetaLayer + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         close_handle_best_effort(self.vfs.clone(), self.fh);
     }
 }
 
-fn close_handle_best_effort<S, M>(vfs: VFS<S, MetaClient<M>>, fh: u64)
+fn close_handle_best_effort<S, M>(vfs: VFS<S, M>, fh: u64)
 where
     S: BlockStore + Send + Sync + 'static,
-    M: MetaStore + 'static,
+    M: MetaLayer + Send + Sync + 'static,
 {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
@@ -2046,19 +2052,18 @@ mod tests {
     use crate::cadapter::localfs::LocalFsBackend;
     use crate::chuck::store::ObjectBlockStore;
     use crate::meta::factory::create_meta_store_from_url;
+    use crate::meta::stores::DatabaseMetaStore;
     use tempfile::tempdir;
 
-    async fn create_test_fs() -> FileSystem<ObjectBlockStore<LocalFsBackend>, Arc<dyn MetaStore>> {
+    async fn create_test_fs()
+    -> FileSystem<ObjectBlockStore<LocalFsBackend>, MetaClient<DatabaseMetaStore>> {
         let tmp = tempdir().unwrap();
         let layout = ChunkLayout::default();
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
-        let metadata: Arc<dyn MetaStore> = meta_handle.store();
         let store = ObjectBlockStore::new(client);
         let config = FileSystemConfig::default().with_caller(CallerIdentity::root());
-        FileSystem::with_config(layout, store, metadata, config)
-            .await
-            .unwrap()
+        FileSystem::from_components(layout, Arc::new(store), meta_handle.layer(), config).unwrap()
     }
 
     #[tokio::test]

@@ -29,270 +29,19 @@ use etcd_client::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, error, info, warn};
 use uuid::Uuid;
+use crate::meta::stores::etcd_txn::{TxnBuilder, UpdatePlan};
 
 /// ID allocation batch size
 /// TODO: make configurable.
 const BATCH_SIZE: i64 = 1000;
 const FIRST_ALLOCATED_ID: i64 = 2;
-
-#[allow(dead_code)]
-enum UpdateAction {
-    Write(Vec<u8>),
-    Delete,
-    Skip,
-}
-
-struct UpdatePlan {
-    key: String,
-    compare: Compare,
-    action: UpdateAction,
-}
-
-impl UpdatePlan {
-    fn new_write(
-        ctx: &TxnContext,
-        key: impl Into<String>,
-        value: Vec<u8>,
-    ) -> Result<Self, MetaError> {
-        let key = key.into();
-        let compare = ctx.compare_for(&key)?;
-        Ok(Self {
-            key,
-            compare,
-            action: UpdateAction::Write(value),
-        })
-    }
-
-    #[allow(dead_code)]
-    fn new_delete(ctx: &TxnContext, key: impl Into<String>) -> Result<Self, MetaError> {
-        let key = key.into();
-        let compare = ctx.compare_for(&key)?;
-        Ok(Self {
-            key,
-            compare,
-            action: UpdateAction::Delete,
-        })
-    }
-}
-
-trait TxnStage: Send + Sync {
-    fn deps(&self) -> &[String];
-
-    fn build(&self, ctx: &TxnContext) -> Result<Vec<UpdatePlan>, MetaError>;
-}
-
-struct TxnStageFn<F> {
-    deps: Vec<String>,
-    f: F,
-}
-
-impl<F> TxnStage for TxnStageFn<F>
-where
-    F: Fn(&TxnContext) -> Result<Vec<UpdatePlan>, MetaError> + Send + Sync,
-{
-    fn deps(&self) -> &[String] {
-        self.deps.as_slice()
-    }
-
-    fn build(&self, ctx: &TxnContext) -> Result<Vec<UpdatePlan>, MetaError> {
-        (self.f)(ctx)
-    }
-}
-
-struct TxnEntry {
-    value: Option<Vec<u8>>,
-    mod_revision: i64,
-}
-
-struct TxnContext {
-    slots: HashMap<String, TxnEntry>,
-}
-
-impl TxnContext {
-    fn compare_for(&self, key: &str) -> Result<Compare, MetaError> {
-        let Some(entry) = self.slots.get(key) else {
-            return Err(MetaError::Internal(format!(
-                "Missing key in transaction context: {key}"
-            )));
-        };
-
-        if entry.mod_revision == 0 {
-            Ok(Compare::version(key, CompareOp::Equal, 0))
-        } else {
-            Ok(Compare::mod_revision(
-                key,
-                CompareOp::Equal,
-                entry.mod_revision,
-            ))
-        }
-    }
-
-    fn value(&self, key: &str) -> Option<&[u8]> {
-        self.slots.get(key).and_then(|entry| entry.value.as_deref())
-    }
-
-    async fn fetch(client: &mut EtcdClient, keys: &[String]) -> Result<Self, MetaError> {
-        if keys.is_empty() {
-            return Ok(Self {
-                slots: HashMap::new(),
-            });
-        }
-
-        let ops: Vec<TxnOp> = keys
-            .iter()
-            .map(|key| TxnOp::get(key.as_bytes(), None))
-            .collect();
-
-        let txn = Txn::new().and_then(ops);
-        let resp = client
-            .txn(txn)
-            .await
-            .map_err(|e| MetaError::Internal(format!("Etcd txn fetch error: {e}")))?;
-
-        let mut slots = HashMap::with_capacity(keys.len());
-
-        // Etcd preserves response order for each request op in the txn success list.
-        let responses = resp.op_responses();
-
-        for (idx, key) in keys.iter().enumerate() {
-            let entry = match responses.get(idx) {
-                Some(TxnOpResponse::Get(range_resp)) => range_resp
-                    .kvs()
-                    .first()
-                    .map(|kv| TxnEntry {
-                        value: Some(kv.value().to_vec()),
-                        mod_revision: kv.mod_revision(),
-                    })
-                    .unwrap_or(TxnEntry {
-                        value: None,
-                        mod_revision: 0,
-                    }),
-                Some(_) => {
-                    return Err(MetaError::Internal(format!(
-                        "Unexpected txn response for key {key}"
-                    )));
-                }
-                None => {
-                    return Err(MetaError::Internal(format!(
-                        "Missing txn response for key {key}"
-                    )));
-                }
-            };
-            slots.insert(key.clone(), entry);
-        }
-
-        Ok(Self { slots })
-    }
-}
-
-struct TxnBuilder {
-    stages: Vec<Box<dyn TxnStage>>,
-}
-
-impl TxnBuilder {
-    fn new() -> Self {
-        Self { stages: Vec::new() }
-    }
-
-    fn add_stage<F>(&mut self, deps: Vec<String>, stage: F)
-    where
-        F: Fn(&TxnContext) -> Result<Vec<UpdatePlan>, MetaError> + Send + Sync + 'static,
-    {
-        self.stages.push(Box::new(TxnStageFn { deps, f: stage }));
-    }
-
-    fn deps(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut deps = Vec::new();
-
-        for stage in &self.stages {
-            for key in stage.deps() {
-                if seen.insert(key.clone()) {
-                    deps.push(key.clone());
-                }
-            }
-        }
-        deps
-    }
-
-    async fn execute(&self, client: &EtcdClient, max_retries: u64) -> Result<(), MetaError> {
-        let deps = self.deps();
-        let stages = &self.stages;
-        let client = client.clone();
-
-        let attempt = || {
-            let deps = deps.clone();
-            let mut client = client.clone();
-
-            async move {
-                let ctx = TxnContext::fetch(&mut client, &deps).await?;
-                let mut plans = Vec::new();
-                for stage in stages {
-                    plans.extend(stage.build(&ctx)?);
-                }
-
-                if plans.is_empty() {
-                    return Ok(());
-                }
-
-                let mut compares = Vec::new();
-                let mut ops = Vec::new();
-                let mut seen_keys = std::collections::HashSet::new();
-
-                for plan in plans {
-                    if !ctx.slots.contains_key(&plan.key) {
-                        return Err(MetaError::Internal(format!(
-                            "Stage generated plan for undeclared key: {}",
-                            plan.key
-                        )));
-                    }
-
-                    if !seen_keys.insert(plan.key.clone()) {
-                        return Err(MetaError::Internal(format!(
-                            "Duplicate update plan for key {}",
-                            plan.key
-                        )));
-                    }
-
-                    match plan.action {
-                        UpdateAction::Skip => continue,
-                        UpdateAction::Write(value) => {
-                            compares.push(plan.compare);
-                            ops.push(TxnOp::put(plan.key, value, None));
-                        }
-                        UpdateAction::Delete => {
-                            compares.push(plan.compare);
-                            ops.push(TxnOp::delete(plan.key, None));
-                        }
-                    }
-                }
-
-                if ops.is_empty() {
-                    return Ok(());
-                }
-
-                let txn = Txn::new().when(compares).and_then(ops);
-
-                match client.txn(txn).await {
-                    Ok(resp) if resp.succeeded() => Ok(()),
-                    Ok(_) => Err(MetaError::ContinueRetry),
-                    Err(e) => Err(MetaError::Internal(format!(
-                        "Failed to execute transaction: {e}"
-                    ))),
-                }
-            }
-        };
-
-        backoff(max_retries, attempt).await
-    }
-}
 
 /// Etcd-based metadata store
 pub struct EtcdMetaStore {
@@ -326,6 +75,10 @@ impl EtcdMetaStore {
             Some(id) => format!("session:{}", id),
             None => "session:".to_string(),
         }
+    }
+
+    fn etcd_slice_ref_key(slice_id: u64) -> String {
+        format!("slice_ref:{slice_id}")
     }
 
     fn etcd_session_info_key(session_id: Option<Uuid>) -> String {
@@ -3201,6 +2954,7 @@ impl MetaStore for EtcdMetaStore {
     async fn cleanup_sessions(&self) -> Result<(), MetaError> {
         return Ok(());
     }
+
     #[tracing::instrument(level = "trace", skip(self), fields(lock_name = ?lock_name))]
     async fn get_global_lock(&self, lock_name: LockName) -> bool {
         let result = self
@@ -3426,6 +3180,104 @@ impl MetaStore for EtcdMetaStore {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    async fn compact_chunk(
+        &self,
+        inode: i64,
+        chunk_id: u64,
+        origin: &[SliceDesc],
+        new: SliceDesc,
+        skipped: usize,
+    ) -> Result<Vec<SliceDesc>, MetaError> {
+        let _ = inode;
+        let key = key_for_slice(chunk_id);
+
+        let ref_ids = origin
+            .iter()
+            .skip(skipped)
+            .map(|s| Self::etcd_slice_ref_key(s.slice_id))
+            .collect::<Vec<_>>();
+
+        let mut deps = Vec::with_capacity(1 + ref_ids.len());
+        deps.push(key.clone());
+        deps.extend(ref_ids.clone());
+
+        TxnBuilder::execute_stage_with(&self.client, deps, 10, move |ctx| {
+            let (mut plans, mut to_delete) = (Vec::new(), Vec::new());
+
+            let Some(slices) = ctx.value_deserialized::<Vec<SliceDesc>>(&key)? else {
+                return Ok((plans, to_delete))
+            };
+
+            if slices != origin {
+                let (left_len, right_len) = (origin.len(), slices.len());
+
+                let mismatch =
+                    origin
+                        .iter()
+                        .zip(slices.iter())
+                        .enumerate()
+                        .find_map(|(idx, (lhs, rhs))| {
+                            if lhs == rhs {
+                                None
+                            } else {
+                                Some((idx, *lhs, *rhs))
+                            }
+                        });
+
+                let detail = if let Some((idx, lhs, rhs)) = mismatch {
+                    format!("first diff at {idx}: expected {lhs:?}, got {rhs:?}")
+                } else {
+                    format!("length mismatch: expected {left_len}, got {right_len}")
+                };
+
+                return Err(MetaError::Internal(format!(
+                    "compact_chunk origin mismatch: {detail}"
+                )));
+            }
+
+            if skipped > slices.len() {
+                return Err(MetaError::Internal(format!(
+                    "compact_chunk skipped {skipped} exceeds slice count {}",
+                    slices.len()
+                )));
+            }
+
+            let mut updated = Vec::with_capacity(skipped.saturating_add(1));
+            updated.extend_from_slice(&slices[..skipped]);
+            updated.push(new);
+
+            let payload = crate::meta::serialization::serialize_meta(&updated)?;
+            plans.push(UpdatePlan::new_write(ctx, key.to_string(), payload)?);
+
+            for ref_id in ref_ids {
+                if let Some(refs) = ctx.value_deserialized::<i64>(&ref_id)? {
+
+                }
+            }
+
+            Ok((plans, to_delete))
+        })
+        .await
+    }
+
+    async fn delete_slices(&self, slices: &[SliceDesc]) -> Result<(), MetaError> {
+        let mut builder = TxnBuilder::new();
+
+        let keys = slices
+            .into_iter()
+            .map(|s| Self::etcd_slice_ref_key(s.slice_id))
+            .collect::<Vec<_>>();
+
+        builder.add_stage(keys, |ctx| {
+            ctx.slots
+                .keys()
+                .map(|k| UpdatePlan::new_delete(ctx, k))
+                .collect::<Result<Vec<_>, MetaError>>()
+        });
+
+        builder.execute(&self.client, 10).await
     }
 
     // returns the current lock owner for a range on a file.

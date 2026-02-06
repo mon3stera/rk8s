@@ -1,30 +1,30 @@
 use crate::chuck::SliceDesc;
-use crate::meta::MetaStore;
 use crate::utils::Intervals;
 
-pub(crate) fn skip_slices(slices: &[SliceDesc]) -> (usize, Vec<SliceDesc>) {
+pub(crate) fn skip_slices(slices: &[SliceDesc]) -> (Vec<SliceDesc>, u64, u64, usize) {
     let mut skipped = 0;
 
     while skipped < slices.len() {
         let original = slices[skipped];
 
-        let (dry_slices, dry_length) = split_slices(&slices[skipped..]);
+        let (dry_slices, dry_offset, dry_length) = split_slices(&slices[skipped..]);
 
         // `compact_slices` ensure there is at least one slice in compaction, so the `unwrap` doesn't cause panic.
         let first = dry_slices.first().unwrap();
 
         // The processed first may not be original.
-        if !(original.length >= (1 << 20) && original.length * 5 >= dry_length) || first != original
+        if !(original.length >= (1 << 20) && original.length * 5 >= dry_length)
+            || *first != original
         {
-            return (skipped, dry_slices);
+            return (dry_slices, dry_offset, dry_length, skipped);
         }
 
         skipped += 1;
     }
-    (slices.len() - 1, Vec::new())
+    (Vec::new(), 0, 0, slices.len() - 1)
 }
 
-pub(crate) fn split_slices(slices: &[SliceDesc]) -> (Vec<SliceDesc>, u64) {
+pub(crate) fn split_slices(slices: &[SliceDesc]) -> (Vec<SliceDesc>, u64, u64) {
     assert!(!slices.is_empty(), "Slices cannot be empty");
 
     let (mut l, mut r) = (u64::MAX, u64::MIN);
@@ -69,7 +69,7 @@ pub(crate) fn split_slices(slices: &[SliceDesc]) -> (Vec<SliceDesc>, u64) {
 
     news.extend(rest);
     news.sort_by_key(|s| (s.offset, s.length));
-    (news, total_length)
+    (news, l, total_length)
 }
 
 #[cfg(test)]

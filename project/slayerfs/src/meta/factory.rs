@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::meta::NoopData;
 use crate::meta::client::{MetaClient, MetaClientOptions};
 use crate::meta::config::{
     CacheConfig, CacheTtl, ClientOptions, Config, DatabaseConfig, DatabaseType,
@@ -97,12 +98,10 @@ impl MetaStoreFactory<DatabaseMetaStore> {
             ..MetaClientOptions::default()
         };
 
-        let client = MetaClient::with_options(
-            Arc::clone(store),
-            config.cache.capacity.clone(),
-            ttl,
-            client_options,
-        );
+        let client = MetaClient::builder(Arc::clone(store), Arc::new(NoopData))
+            .with_cache(config.cache.capacity.clone(), ttl)
+            .with_options(client_options)
+            .build();
 
         client.initialize().await?;
         Ok(client)
@@ -153,12 +152,10 @@ impl MetaStoreFactory<RedisMetaStore> {
             ..MetaClientOptions::default()
         };
 
-        let client = MetaClient::with_options(
-            Arc::clone(store),
-            config.cache.capacity.clone(),
-            ttl,
-            client_options,
-        );
+        let client = MetaClient::builder(Arc::clone(store), Arc::new(NoopData))
+            .with_cache(config.cache.capacity.clone(), ttl)
+            .with_options(client_options)
+            .build();
 
         client.initialize().await?;
         Ok(client)
@@ -207,12 +204,10 @@ impl MetaStoreFactory<EtcdMetaStore> {
             ..MetaClientOptions::default()
         };
 
-        let client = MetaClient::with_options(
-            Arc::clone(store),
-            config.cache.capacity.clone(),
-            ttl,
-            client_options,
-        );
+        let client = MetaClient::builder(Arc::clone(store), Arc::new(NoopData))
+            .with_cache(config.cache.capacity.clone(), ttl)
+            .with_options(client_options)
+            .build();
 
         client.initialize().await?;
         Ok(client)

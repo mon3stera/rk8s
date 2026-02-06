@@ -45,6 +45,12 @@ pub trait MetaLayer: Send + Sync {
 
     async fn lookup_path(&self, path: &str) -> Result<Option<(i64, FileType)>, MetaError>;
 
+    /// Resolve a path with lstat semantics (do not follow the final symlink).
+    async fn resolve_path(&self, path: &str) -> Result<i64, MetaError>;
+
+    /// Resolve a path with stat semantics (follow the final symlink).
+    async fn resolve_path_follow(&self, path: &str) -> Result<i64, MetaError>;
+
     async fn lookup_path_with_attr(
         &self,
         path: &str,
@@ -223,6 +229,8 @@ pub trait MetaLayer: Send + Sync {
     async fn next_id(&self, key: &str) -> Result<i64, MetaError>;
 
     async fn compact_chunk(&self, ino: i64, chunk_id: u64, sync: bool) -> Result<(), MetaError>;
+
+    async fn delete_slices(&self, slices: &[SliceDesc]) -> Result<(), MetaError>;
 
     // ---------- Session lifecycle ----------
     async fn start_session(&self, session_info: SessionInfo) -> Result<(), MetaError>;

@@ -10,6 +10,7 @@ pub mod etcd_store;
 pub(crate) mod etcd_watch;
 pub(crate) mod pool;
 pub mod redis_store;
+mod etcd_txn;
 
 // Re-export main types for convenience
 pub use database_store::DatabaseMetaStore;

@@ -3,9 +3,7 @@
 use super::chunk::ChunkLayout;
 use super::slice::{SliceDesc, block_span_iter};
 use super::store::BlockStore;
-use crate::meta::MetaLayer;
 use crate::utils::NumCastExt;
-use crate::vfs::backend::Backend;
 use anyhow::Result;
 use bytes::Bytes;
 use futures_util::future::join_all;
@@ -46,23 +44,18 @@ impl<'a> ChunkCursor<'a> {
     }
 }
 
-pub(crate) struct DataUploader<'a, B, M> {
+pub(crate) struct DataUploader<'a, B> {
     layout: ChunkLayout,
     id: u64,
-    backend: &'a Backend<B, M>,
+    store: &'a B,
 }
 
-impl<'a, B, M> DataUploader<'a, B, M>
+impl<'a, B> DataUploader<'a, B>
 where
     B: BlockStore + Sync,
-    M: MetaLayer,
 {
-    pub(crate) fn new(layout: ChunkLayout, id: u64, backend: &'a Backend<B, M>) -> Self {
-        Self {
-            layout,
-            id,
-            backend,
-        }
+    pub(crate) fn new(layout: ChunkLayout, id: u64, store: &'a B) -> Self {
+        Self { layout, id, store }
     }
 
     /// Write a slice from a set of byte segments without concatenating them.
@@ -94,11 +87,9 @@ where
             let block_chunks = cursor.take(span.len.as_usize());
 
             let block_index = span.index.as_u32();
-            let future = self.backend.store().write_fresh_vectored(
-                (slice_id, block_index),
-                span.offset,
-                block_chunks,
-            );
+            let future =
+                self.store
+                    .write_fresh_vectored((slice_id, block_index), span.offset, block_chunks);
             futures.push(future);
         }
 
@@ -117,7 +108,6 @@ mod tests {
     use crate::chuck::store::InMemoryBlockStore;
     use crate::meta::SLICE_ID_KEY;
     use crate::meta::factory::create_meta_store_from_url;
-    use crate::vfs::backend::Backend;
     use bytes::Bytes;
     use std::sync::Arc;
 
@@ -144,21 +134,21 @@ mod tests {
             .await
             .unwrap()
             .layer();
-        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
 
         let data = patterned(layout.block_size as usize + 512, 7);
         let offset = 512u64;
         let slice_id = meta.next_id(SLICE_ID_KEY).await.unwrap();
 
-        let uploader = DataUploader::new(layout, 1, backend.as_ref());
+        let uploader = DataUploader::new(layout, 1, store.as_ref());
         let desc = uploader
             .write_at_vectored(slice_id as u64, offset, &[Bytes::copy_from_slice(&data)])
             .await
             .unwrap();
         meta.append_slice(1, desc).await.unwrap();
 
-        let mut fetcher = DataFetcher::new(layout, 1, backend.as_ref());
-        fetcher.prepare_slices().await.unwrap();
+        let slices = meta.get_slices(1).await.unwrap();
+        let mut fetcher = DataFetcher::new(layout, 1, store.as_ref());
+        fetcher.prepare_slices(slices).await;
         let out = fetcher.read_at(offset, data.len()).await.unwrap();
         assert_eq!(out, data);
     }
@@ -171,7 +161,6 @@ mod tests {
             .await
             .unwrap()
             .layer();
-        let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
 
         let offset = layout.block_size as u64 - 128;
         let part1 = patterned(300, 5);
@@ -185,15 +174,16 @@ mod tests {
         let chunks = vec![Bytes::from(part1), Bytes::from(part2), Bytes::from(part3)];
 
         let slice_id = meta.next_id(SLICE_ID_KEY).await.unwrap();
-        let uploader = DataUploader::new(layout, 8, backend.as_ref());
+        let uploader = DataUploader::new(layout, 8, store.as_ref());
         let desc = uploader
             .write_at_vectored(slice_id as u64, offset, &chunks)
             .await
             .unwrap();
         meta.append_slice(8, desc).await.unwrap();
 
-        let mut fetcher = DataFetcher::new(layout, 8, backend.as_ref());
-        fetcher.prepare_slices().await.unwrap();
+        let slices = meta.get_slices(8).await.unwrap();
+        let mut fetcher = DataFetcher::new(layout, 8, store.as_ref());
+        fetcher.prepare_slices(slices).await;
         let out = fetcher.read_at(offset, data.len()).await.unwrap();
         assert_eq!(out, data);
     }

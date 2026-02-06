@@ -12,11 +12,12 @@
 //! - Ensure critical write-path updates (blocks + slice_blocks + slices + inode.size)
 //!   are committed atomically.
 //!
+mod background;
 pub(crate) mod backoff;
 pub mod client;
 mod compact;
 pub mod config;
-mod data;
+pub(crate) mod data;
 pub(crate) mod entities;
 pub mod factory;
 pub mod file_lock;
@@ -30,6 +31,8 @@ pub mod stores;
 // Primary exports
 #[allow(dead_code)]
 pub type MetaHandle<M> = factory::MetaHandle<M>;
+pub use data::NoopData;
+pub(crate) use data::{WithDataFn, default_data_op};
 #[allow(unused_imports)]
 pub use factory::{create_meta_store_from_url, create_redis_meta_store_from_url};
 pub use layer::MetaLayer;

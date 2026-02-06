@@ -8,6 +8,7 @@ pub(crate) mod locks_meta;
 pub(crate) mod plock_meta;
 pub(crate) mod session_meta;
 pub(crate) mod slice_meta;
+mod slice_ref_meta;
 pub(crate) mod xattr_meta;
 
 pub(crate) use access_meta::{Entity as AccessMeta, Model as AccessMetaModel};

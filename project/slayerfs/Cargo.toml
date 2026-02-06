@@ -53,6 +53,7 @@ uuid = { workspace = true, features = ["v7"] }
 parking_lot = { workspace = true }
 tikv-jemallocator = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true, features = ["uuid-1"] }
+async-channel = { workspace = true }
 
 [features]
 profiling = ["dep:tracing-flame", "dep:tracing-chrome", "dep:console-subscriber"]

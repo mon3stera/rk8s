@@ -888,7 +888,8 @@ where
 
                 let offset = offset + uploaded;
 
-                let uploader = DataUploader::new(shared.config.layout, chunk_id, &shared.backend);
+                let uploader =
+                    DataUploader::new(shared.config.layout, chunk_id, shared.backend.store());
                 let result = backoff(UPLOAD_MAX_RETRIES, || async {
                     match uploader
                         .write_at_vectored(slice_id, offset, &all_chunks)
@@ -1453,8 +1454,9 @@ mod tests {
         let slices = meta_store.get_slices(cid).await.unwrap();
         assert_eq!(slices.len(), 1);
 
-        let mut reader = DataFetcher::new(layout, cid, backend.as_ref());
-        reader.prepare_slices().await.unwrap();
+        let slices = meta_store.get_slices(cid).await.unwrap();
+        let mut reader = DataFetcher::new(layout, cid, backend.store());
+        reader.prepare_slices(slices).await;
         let out = reader.read_at(0, len).await.unwrap();
         assert_eq!(out, data);
     }
@@ -1497,8 +1499,9 @@ mod tests {
         let slices = meta_store.get_slices(cid).await.unwrap();
         assert_eq!(slices.len(), 1);
 
-        let mut reader = DataFetcher::new(layout, cid, backend.as_ref());
-        reader.prepare_slices().await.unwrap();
+        let slices = meta_store.get_slices(cid).await.unwrap();
+        let mut reader = DataFetcher::new(layout, cid, backend.store());
+        reader.prepare_slices(slices).await;
         let out = reader.read_at(0, len).await.unwrap();
         assert_eq!(out, second);
     }

@@ -6,8 +6,8 @@ use crate::meta::store::FileAttr;
 use crate::vfs::fs::DirEntry;
 use crate::vfs::io::{FileReader, FileWriter};
 use anyhow::anyhow;
+use parking_lot::Mutex as StdMutex;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::pin;
@@ -53,7 +53,7 @@ impl HandleGate {
             // we will cause a lost wake-up!
             notified.as_mut().enable();
             {
-                let mut guard = self.state.lock().unwrap();
+                let mut guard = self.state.lock();
 
                 if !guard.writing && guard.writers_waiting == 0 {
                     guard.readers = guard.readers.saturating_add(1);
@@ -78,7 +78,7 @@ impl HandleGate {
             notified.as_mut().enable();
 
             {
-                let mut guard = self.state.lock().unwrap();
+                let mut guard = self.state.lock();
 
                 if guard.readers == 0 && !guard.writing {
                     guard.writing = true;
@@ -95,7 +95,7 @@ impl HandleGate {
     }
 
     fn read_unlock(&self) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock();
         guard.readers = guard.readers.saturating_sub(1);
 
         if guard.readers == 0 {
@@ -104,13 +104,13 @@ impl HandleGate {
     }
 
     fn write_unlock(&self) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock();
         guard.writing = false;
         self.notify.notify_waiters();
     }
 
     fn waiting_dec(&self) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock();
         guard.writers_waiting = guard.writers_waiting.saturating_sub(1);
         self.notify.notify_waiters();
     }
@@ -144,7 +144,7 @@ struct HandleWriteWaiter<'a> {
 impl<'a> HandleWriteWaiter<'a> {
     fn new(gate: &'a HandleGate) -> Self {
         {
-            let mut guard = gate.state.lock().unwrap();
+            let mut guard = gate.state.lock();
             guard.writers_waiting = guard.writers_waiting.saturating_add(1);
         }
         Self { gate, active: true }
@@ -210,37 +210,37 @@ where
     }
 
     pub(crate) fn reader(&self, reader: Arc<FileReader<B, M>>) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock();
         guard.reader = Some(reader);
     }
 
     pub(crate) fn writer(&self, writer: Arc<FileWriter<B, M>>) {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock();
         guard.writer = Some(writer);
     }
 
     pub(crate) fn attr(&self) -> FileAttr {
-        self.state.lock().unwrap().attr.clone()
+        self.state.lock().attr.clone()
     }
 
     pub(crate) fn update_attr(&self, attr: &FileAttr) {
-        self.state.lock().unwrap().attr = attr.clone();
+        self.state.lock().attr = attr.clone();
     }
 
     pub(crate) fn update_offset(&self, offset: u64) {
-        self.state.lock().unwrap().last_offset = offset;
+        self.state.lock().last_offset = offset;
     }
 
     #[allow(dead_code)]
     pub(crate) fn last_offset(&self) -> u64 {
-        self.state.lock().unwrap().last_offset
+        self.state.lock().last_offset
     }
 
     #[tracing::instrument(name = "Handle.read", level = "trace", skip(self))]
     pub(crate) async fn read(&self, offset: u64, len: usize) -> anyhow::Result<Vec<u8>> {
         let _guard = self.gate.read_lock().await;
         let reader = {
-            let guard = self.state.lock().unwrap();
+            let guard = self.state.lock();
             guard
                 .reader
                 .clone()
@@ -254,7 +254,7 @@ where
     pub(crate) async fn write(&self, offset: u64, data: &[u8]) -> anyhow::Result<usize> {
         let _guard = self.gate.write_lock().await;
         let writer = {
-            let guard = self.state.lock().unwrap();
+            let guard = self.state.lock();
             guard
                 .writer
                 .clone()
@@ -268,7 +268,7 @@ where
     pub(crate) async fn flush(&self) -> anyhow::Result<()> {
         let _guard = self.gate.write_lock().await;
         let writer = {
-            let guard = self.state.lock().unwrap();
+            let guard = self.state.lock();
             guard
                 .writer
                 .clone()

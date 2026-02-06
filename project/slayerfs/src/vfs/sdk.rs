@@ -10,13 +10,14 @@
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
 use crate::fs::{FileSystem, FileSystemConfig, OpenFlags};
-use crate::meta::MetaStore;
+use crate::meta::client::MetaClient;
 use crate::meta::factory::create_meta_store_from_url;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{
     DirEntry, FileAttr, FileType, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
 };
 use crate::meta::stores::DatabaseMetaStore;
+use crate::meta::{MetaLayer, MetaStore, WithDataFn};
 use std::future::Future;
 use std::io;
 use std::path::Path;
@@ -39,20 +40,28 @@ fn deadlock_backoff(attempt: usize) -> Duration {
 }
 
 /// SDK client parametrized by its backend.
-pub struct VfsClient<S: BlockStore + Send + Sync + 'static, M: MetaStore + 'static> {
+pub struct VfsClient<S: BlockStore + Send + Sync + 'static, M: MetaLayer + Send + Sync + 'static> {
     fs: FileSystem<S, M>,
 }
 
 #[allow(unused)]
-impl<S: BlockStore + Send + Sync + 'static, M: MetaStore + 'static> VfsClient<S, M> {
-    pub async fn new(layout: ChunkLayout, store: S, meta: M) -> io::Result<Self> {
+impl<S, R> VfsClient<S, MetaClient<R, WithDataFn>>
+where
+    S: BlockStore + Send + Sync + 'static,
+    R: MetaStore + Send + Sync + 'static,
+{
+    pub async fn new(layout: ChunkLayout, store: S, meta: R) -> io::Result<Self> {
         let fs = FileSystem::new(layout, store, meta).await?;
         Ok(Self { fs })
     }
 }
 
 #[allow(unused)]
-impl<S: BlockStore + Send + Sync + 'static, M: MetaStore + 'static> VfsClient<S, M> {
+impl<S, M> VfsClient<S, M>
+where
+    S: BlockStore + Send + Sync + 'static,
+    M: MetaLayer + Send + Sync + 'static,
+{
     pub fn from_filesystem(fs: FileSystem<S, M>) -> Self {
         Self { fs }
     }
@@ -243,7 +252,7 @@ use crate::chuck::store::ObjectBlockStore;
 use std::sync::Arc;
 
 #[allow(dead_code)]
-pub type LocalClient = VfsClient<ObjectBlockStore<LocalFsBackend>, DatabaseMetaStore>;
+pub type LocalClient = VfsClient<ObjectBlockStore<LocalFsBackend>, MetaClient<DatabaseMetaStore>>;
 
 #[allow(dead_code)]
 impl LocalClient {
@@ -253,13 +262,11 @@ impl LocalClient {
         let meta_handle = create_meta_store_from_url("sqlite::memory:")
             .await
             .map_err(io::Error::other)?;
-        let meta = meta_handle.store();
         let meta_layer = meta_handle.layer();
         let store = Arc::new(ObjectBlockStore::new(client));
         let fs = FileSystem::from_components(
             layout,
             Arc::clone(&store),
-            meta,
             meta_layer,
             FileSystemConfig::default(),
         )?;
@@ -276,10 +283,9 @@ impl LocalClient {
         let meta_handle = create_meta_store_from_url("sqlite::memory:")
             .await
             .map_err(io::Error::other)?;
-        let meta = meta_handle.store();
         let meta_layer = meta_handle.layer();
         let store = Arc::new(ObjectBlockStore::new(client));
-        let fs = FileSystem::from_components(layout, Arc::clone(&store), meta, meta_layer, config)?;
+        let fs = FileSystem::from_components(layout, Arc::clone(&store), meta_layer, config)?;
         Ok(VfsClient { fs })
     }
 }

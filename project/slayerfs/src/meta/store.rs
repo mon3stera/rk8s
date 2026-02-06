@@ -589,8 +589,8 @@ pub trait MetaStore: Send + Sync {
         Err(MetaError::NotImplemented)
     }
 
-    async fn delete_slice(&self, slice_id: u64, size: u32) -> Result<(), MetaError> {
-        let _ = (slice_id, size);
+    async fn delete_slices(&self, slices: &[SliceDesc]) -> Result<(), MetaError> {
+        let _ = slices;
         Err(MetaError::NotImplemented)
     }
 
@@ -822,7 +822,7 @@ pub trait MetaStore: Send + Sync {
         origin: &[SliceDesc],
         new: SliceDesc,
         skipped: usize,
-    ) -> Result<(), MetaError> {
+    ) -> Result<Vec<SliceDesc>, MetaError> {
         let _ = (inode, chunk_id, origin, new, skipped);
         Err(MetaError::NotImplemented)
     }

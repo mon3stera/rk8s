@@ -3,6 +3,7 @@
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
 use crate::meta::MetaLayer;
+use crate::meta::WithDataFn;
 use crate::meta::client::MetaClient;
 use crate::meta::config::MetaClientConfig;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
@@ -270,7 +271,7 @@ where
     }
 }
 
-impl<S, R> VFS<S, MetaClient<R>>
+impl<S, R> VFS<S, MetaClient<R, WithDataFn>>
 where
     S: BlockStore + Send + Sync + 'static,
     R: MetaStore + Send + Sync + 'static,
@@ -290,12 +291,11 @@ where
 
         let ttl = config.effective_ttl();
 
-        let meta_client = MetaClient::with_options(
-            Arc::clone(&meta),
-            config.capacity.clone(),
-            ttl,
-            config.options.clone(),
-        );
+        let data_op = crate::meta::default_data_op(layout, Arc::clone(&store));
+        let meta_client = MetaClient::builder(Arc::clone(&meta), data_op)
+            .with_cache(config.capacity.clone(), ttl)
+            .with_options(config.options.clone())
+            .build();
 
         meta_client.initialize().await.map_err(VfsError::from)?;
 
