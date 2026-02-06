@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use etcd_client::{Client, Compare, CompareOp, Txn, TxnOp, TxnOpResponse};
+
+use etcd_client::{Client, Compare, CompareOp, Txn, TxnOp, TxnOpResponse, TxnResponse};
+
 use crate::meta::backoff::backoff;
 use crate::meta::store::MetaError;
 
@@ -24,6 +26,7 @@ impl UpdatePlan {
     ) -> Result<Self, MetaError> {
         let key = key.into();
         let compare = ctx.compare_for(&key)?;
+
         Ok(Self {
             key,
             compare,
@@ -34,35 +37,12 @@ impl UpdatePlan {
     pub(crate) fn new_delete(ctx: &TxnContext, key: impl Into<String>) -> Result<Self, MetaError> {
         let key = key.into();
         let compare = ctx.compare_for(&key)?;
+
         Ok(Self {
             key,
             compare,
             action: UpdateAction::Delete,
         })
-    }
-}
-
-pub(crate) trait TxnStage: Send + Sync {
-    fn deps(&self) -> &[String];
-
-    fn build(&self, ctx: &TxnContext) -> Result<Vec<UpdatePlan>, MetaError>;
-}
-
-pub(crate) struct TxnStageFn<F> {
-    deps: Vec<String>,
-    f: F,
-}
-
-impl<F> TxnStage for TxnStageFn<F>
-where
-    F: Fn(&TxnContext) -> Result<Vec<UpdatePlan>, MetaError> + Send + Sync,
-{
-    fn deps(&self) -> &[String] {
-        self.deps.as_slice()
-    }
-
-    fn build(&self, ctx: &TxnContext) -> Result<Vec<UpdatePlan>, MetaError> {
-        (self.f)(ctx)
     }
 }
 
@@ -98,11 +78,12 @@ impl TxnContext {
         self.slots.get(key).and_then(|entry| entry.value.as_deref())
     }
 
+    #[cfg(feature = "rkyv-serialization")]
     pub(crate) fn value_deserialized<T>(&self, key: &str) -> Result<Option<T>, MetaError>
     where
         T: rkyv::Archive,
         T::Archived:
-        rkyv::Deserialize<T, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
+            rkyv::Deserialize<T, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
         for<'de> T: serde::Deserialize<'de>,
     {
         self.slots
@@ -110,7 +91,24 @@ impl TxnContext {
             .and_then(|entry| {
                 entry
                     .value
-                    .map(|e| crate::meta::serialization::deserialize_meta(&e))
+                    .as_deref()
+                    .map(|e| crate::meta::serialization::deserialize_meta(e))
+            })
+            .transpose()
+    }
+
+    #[cfg(not(feature = "rkyv-serialization"))]
+    pub(crate) fn value_deserialized<T>(&self, key: &str) -> Result<Option<T>, MetaError>
+    where
+        for<'de> T: serde::Deserialize<'de>,
+    {
+        self.slots
+            .get(key)
+            .and_then(|entry| {
+                entry
+                    .value
+                    .as_deref()
+                    .map(|e| crate::meta::serialization::deserialize_meta(e))
             })
             .transpose()
     }
@@ -170,200 +168,151 @@ impl TxnContext {
     }
 }
 
-pub(crate) struct TxnBuilder {
-    stages: Vec<Box<dyn TxnStage>>,
-}
+fn build_ops(
+    ctx: &TxnContext,
+    plans: Vec<UpdatePlan>,
+) -> Result<(Vec<Compare>, Vec<TxnOp>), MetaError> {
+    let mut compares = Vec::new();
+    let mut ops = Vec::new();
+    let mut seen_keys = std::collections::HashSet::new();
 
-impl TxnBuilder {
-    pub(crate) fn new() -> Self {
-        Self { stages: Vec::new() }
-    }
+    for plan in plans {
+        if !ctx.slots.contains_key(&plan.key) {
+            return Err(MetaError::Internal(format!(
+                "Stage generated plan for undeclared key: {}",
+                plan.key
+            )));
+        }
 
-    pub(crate) fn add_stage<F>(&mut self, deps: Vec<String>, stage: F)
-    where
-        F: Fn(&TxnContext) -> Result<Vec<UpdatePlan>, MetaError> + Send + Sync + 'static,
-    {
-        self.stages.push(Box::new(TxnStageFn { deps, f: stage }));
-    }
+        if !seen_keys.insert(plan.key.clone()) {
+            return Err(MetaError::Internal(format!(
+                "Duplicate update plan for key {}",
+                plan.key
+            )));
+        }
 
-    pub(crate) fn deps(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut deps = Vec::new();
-
-        for stage in &self.stages {
-            for key in stage.deps() {
-                if seen.insert(key.clone()) {
-                    deps.push(key.clone());
-                }
+        match plan.action {
+            UpdateAction::Skip => continue,
+            UpdateAction::Write(value) => {
+                compares.push(plan.compare);
+                ops.push(TxnOp::put(plan.key, value, None));
+            }
+            UpdateAction::Delete => {
+                compares.push(plan.compare);
+                ops.push(TxnOp::delete(plan.key, None));
             }
         }
-        deps
     }
 
-    pub(crate) async fn execute(&self, client: &Client, max_retries: u64) -> Result<(), MetaError> {
-        self.execute_with(client, max_retries, |_| Ok(())).await
+    Ok((compares, ops))
+}
+
+async fn execute_stage<R, F>(
+    client: &Client,
+    deps: Vec<String>,
+    build: &F,
+    retry_on_conflict: bool,
+) -> Result<(R, Option<TxnResponse>), MetaError>
+where
+    R: Default,
+    F: Fn(&TxnContext) -> Result<(Vec<UpdatePlan>, R), MetaError> + Send + Sync,
+{
+    let mut client = client.clone();
+
+    let ctx = TxnContext::fetch(&mut client, &deps).await?;
+    let (plans, result) = build(&ctx)?;
+
+    if plans.is_empty() {
+        return Ok((R::default(), None));
     }
 
-    pub(crate) async fn execute_with<R, F>(
-        &self,
-        client: &Client,
-        max_retries: u64,
-        result_fn: F,
-    ) -> Result<R, MetaError>
-    where
-        R: Default,
-        F: Fn(&TxnContext) -> Result<R, MetaError> + Send + Sync,
-    {
-        let deps = self.deps();
-        let stages = &self.stages;
-        let client = client.clone();
+    let (compares, ops) = build_ops(&ctx, plans)?;
 
-        let attempt = || {
-            let deps = deps.clone();
-            let mut client = client.clone();
+    if ops.is_empty() {
+        return Ok((R::default(), None));
+    }
 
-            let result_fn = &result_fn;
+    let txn = Txn::new().when(compares).and_then(ops);
 
-            async move {
-                let ctx = TxnContext::fetch(&mut client, &deps).await?;
-                let mut plans = Vec::new();
-                for stage in stages {
-                    plans.extend(stage.build(&ctx)?);
-                }
-
-                if plans.is_empty() {
-                    return Ok(R::default());
-                }
-
-                let result = result_fn(&ctx)?;
-
-                let mut compares = Vec::new();
-                let mut ops = Vec::new();
-                let mut seen_keys = std::collections::HashSet::new();
-
-                for plan in plans {
-                    if !ctx.slots.contains_key(&plan.key) {
-                        return Err(MetaError::Internal(format!(
-                            "Stage generated plan for undeclared key: {}",
-                            plan.key
-                        )));
-                    }
-
-                    if !seen_keys.insert(plan.key.clone()) {
-                        return Err(MetaError::Internal(format!(
-                            "Duplicate update plan for key {}",
-                            plan.key
-                        )));
-                    }
-
-                    match plan.action {
-                        UpdateAction::Skip => continue,
-                        UpdateAction::Write(value) => {
-                            compares.push(plan.compare);
-                            ops.push(TxnOp::put(plan.key, value, None));
-                        }
-                        UpdateAction::Delete => {
-                            compares.push(plan.compare);
-                            ops.push(TxnOp::delete(plan.key, None));
-                        }
-                    }
-                }
-
-                if ops.is_empty() {
-                    return Ok(R::default());
-                }
-
-                let txn = Txn::new().when(compares).and_then(ops);
-
-                match client.txn(txn).await {
-                    Ok(resp) if resp.succeeded() => Ok(result),
-                    Ok(_) => Err(MetaError::ContinueRetry),
-                    Err(e) => Err(MetaError::Internal(format!(
-                        "Failed to execute transaction: {e}"
-                    ))),
-                }
+    match client.txn(txn).await {
+        Ok(resp) if resp.succeeded() => Ok((result, Some(resp))),
+        Ok(_) => {
+            if retry_on_conflict {
+                Err(MetaError::ContinueRetry)
+            } else {
+                Err(MetaError::TxnConflict)
             }
-        };
-
-        backoff(max_retries, attempt).await
+        }
+        Err(e) => Err(MetaError::Internal(format!(
+            "Failed to execute transaction: {e}"
+        ))),
     }
+}
 
-    pub(crate) async fn execute_stage_with<R, F>(
-        client: &Client,
-        deps: Vec<String>,
-        max_retries: u64,
-        build: F,
-    ) -> Result<R, MetaError>
-    where
-        R: Default,
-        F: Fn(&TxnContext) -> Result<(Vec<UpdatePlan>, R), MetaError> + Send + Sync,
-    {
+pub(crate) async fn execute_backoff_with<R, F>(
+    client: &Client,
+    deps: Vec<String>,
+    max_retries: u64,
+    build: F,
+) -> Result<(R, Option<TxnResponse>), MetaError>
+where
+    R: Default,
+    F: Fn(&TxnContext) -> Result<(Vec<UpdatePlan>, R), MetaError> + Send + Sync,
+{
+    let client = client.clone();
+
+    let attempt = || {
+        let deps = deps.clone();
         let client = client.clone();
+        let build = &build;
 
-        let attempt = || {
-            let deps = deps.clone();
-            let mut client = client.clone();
+        async move { execute_stage(&client, deps, build, true).await }
+    };
 
-            let result_fn = &build;
+    backoff(max_retries, attempt).await
+}
 
-            async move {
-                let ctx = TxnContext::fetch(&mut client, &deps).await?;
-                let (plans, result) = build(&ctx)?;
+pub(crate) async fn execute_once_with<R, F>(
+    client: &Client,
+    deps: Vec<String>,
+    build: F,
+) -> Result<(R, Option<TxnResponse>), MetaError>
+where
+    R: Default,
+    F: Fn(&TxnContext) -> Result<(Vec<UpdatePlan>, R), MetaError> + Send + Sync,
+{
+    execute_stage(client, deps, &build, false).await
+}
 
-                if plans.is_empty() {
-                    return Ok(R::default());
-                }
+pub(crate) async fn execute_backoff<F>(
+    client: &Client,
+    deps: Vec<String>,
+    max_retries: u64,
+    build: F,
+) -> Result<Option<TxnResponse>, MetaError>
+where
+    F: Fn(&TxnContext) -> Result<Vec<UpdatePlan>, MetaError> + Send + Sync,
+{
+    let ((), resp) = execute_backoff_with(client, deps, max_retries, |ctx| {
+        let plans = build(ctx)?;
+        Ok((plans, ()))
+    })
+    .await?;
+    Ok(resp)
+}
 
-                let result = result_fn(&ctx)?;
-
-                let mut compares = Vec::new();
-                let mut ops = Vec::new();
-                let mut seen_keys = std::collections::HashSet::new();
-
-                for plan in plans {
-                    if !ctx.slots.contains_key(&plan.key) {
-                        return Err(MetaError::Internal(format!(
-                            "Stage generated plan for undeclared key: {}",
-                            plan.key
-                        )));
-                    }
-
-                    if !seen_keys.insert(plan.key.clone()) {
-                        return Err(MetaError::Internal(format!(
-                            "Duplicate update plan for key {}",
-                            plan.key
-                        )));
-                    }
-
-                    match plan.action {
-                        UpdateAction::Skip => continue,
-                        UpdateAction::Write(value) => {
-                            compares.push(plan.compare);
-                            ops.push(TxnOp::put(plan.key, value, None));
-                        }
-                        UpdateAction::Delete => {
-                            compares.push(plan.compare);
-                            ops.push(TxnOp::delete(plan.key, None));
-                        }
-                    }
-                }
-
-                if ops.is_empty() {
-                    return Ok(R::default());
-                }
-
-                let txn = Txn::new().when(compares).and_then(ops);
-
-                match client.txn(txn).await {
-                    Ok(resp) if resp.succeeded() => Ok(result),
-                    Ok(_) => Err(MetaError::ContinueRetry),
-                    Err(e) => Err(MetaError::Internal(format!(
-                        "Failed to execute transaction: {e}"
-                    ))),
-                }
-            }
-        };
-
-        backoff(max_retries, attempt).await
-    }
+pub(crate) async fn execute_once<F>(
+    client: &Client,
+    deps: Vec<String>,
+    build: F,
+) -> Result<Option<TxnResponse>, MetaError>
+where
+    F: Fn(&TxnContext) -> Result<Vec<UpdatePlan>, MetaError> + Send + Sync,
+{
+    let ((), resp) = execute_once_with(client, deps, |ctx| {
+        let plans = build(ctx)?;
+        Ok((plans, ()))
+    })
+    .await?;
+    Ok(resp)
 }

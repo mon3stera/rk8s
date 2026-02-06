@@ -17,6 +17,7 @@ use crate::meta::file_lock::{
 use crate::meta::store::{
     DirEntry, FileAttr, LockName, MetaError, MetaStore, SetAttrFlags, SetAttrRequest,
 };
+use crate::meta::stores::etcd_txn::{UpdatePlan, execute_backoff, execute_backoff_with};
 use crate::meta::stores::pool::IdPool;
 use crate::meta::{INODE_ID_KEY, Permission};
 use crate::vfs::chunk_id_for;
@@ -29,14 +30,13 @@ use etcd_client::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, error, info, warn};
 use uuid::Uuid;
-use crate::meta::stores::etcd_txn::{TxnBuilder, UpdatePlan};
 
 /// ID allocation batch size
 /// TODO: make configurable.
@@ -2839,8 +2839,9 @@ impl MetaStore for EtcdMetaStore {
         let slice_key_for_stage = slice_key.clone();
         let inode_key_for_stage = inode_key.clone();
 
-        let mut builder = TxnBuilder::new();
-        builder.add_stage(vec![slice_key, inode_key], move |ctx| {
+        let deps = vec![slice_key, inode_key];
+
+        execute_backoff(&self.client, deps, 10, move |ctx| {
             let mut plans = Vec::new();
             let mut slices: Vec<SliceDesc> = match ctx.value(&slice_key_for_stage) {
                 Some(raw) => crate::meta::serialization::deserialize_meta(raw)?,
@@ -2889,9 +2890,10 @@ impl MetaStore for EtcdMetaStore {
             }
 
             Ok(plans)
-        });
+        })
+        .await?;
 
-        builder.execute(&self.client, 10).await
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self), fields(key))]
@@ -3203,81 +3205,78 @@ impl MetaStore for EtcdMetaStore {
         deps.push(key.clone());
         deps.extend(ref_ids.clone());
 
-        TxnBuilder::execute_stage_with(&self.client, deps, 10, move |ctx| {
-            let (mut plans, mut to_delete) = (Vec::new(), Vec::new());
+        let (to_delete, _resp) =
+            execute_backoff_with(&self.client, deps, 10, move |ctx| {
+                let (mut plans, mut to_delete) = (Vec::new(), Vec::new());
 
-            let Some(slices) = ctx.value_deserialized::<Vec<SliceDesc>>(&key)? else {
-                return Ok((plans, to_delete))
-            };
+                let Some(slices) = ctx.value_deserialized::<Vec<SliceDesc>>(&key)? else {
+                    return Ok((plans, to_delete));
+                };
 
-            if slices != origin {
-                let (left_len, right_len) = (origin.len(), slices.len());
+                if slices != origin {
+                    let (left_len, right_len) = (origin.len(), slices.len());
 
-                let mismatch =
-                    origin
-                        .iter()
-                        .zip(slices.iter())
-                        .enumerate()
-                        .find_map(|(idx, (lhs, rhs))| {
+                    let mismatch = origin.iter().zip(slices.iter()).enumerate().find_map(
+                        |(idx, (lhs, rhs))| {
                             if lhs == rhs {
                                 None
                             } else {
                                 Some((idx, *lhs, *rhs))
                             }
-                        });
+                        },
+                    );
 
-                let detail = if let Some((idx, lhs, rhs)) = mismatch {
-                    format!("first diff at {idx}: expected {lhs:?}, got {rhs:?}")
-                } else {
-                    format!("length mismatch: expected {left_len}, got {right_len}")
-                };
+                    let detail = if let Some((idx, lhs, rhs)) = mismatch {
+                        format!("first diff at {idx}: expected {lhs:?}, got {rhs:?}")
+                    } else {
+                        format!("length mismatch: expected {left_len}, got {right_len}")
+                    };
 
-                return Err(MetaError::Internal(format!(
-                    "compact_chunk origin mismatch: {detail}"
-                )));
-            }
-
-            if skipped > slices.len() {
-                return Err(MetaError::Internal(format!(
-                    "compact_chunk skipped {skipped} exceeds slice count {}",
-                    slices.len()
-                )));
-            }
-
-            let mut updated = Vec::with_capacity(skipped.saturating_add(1));
-            updated.extend_from_slice(&slices[..skipped]);
-            updated.push(new);
-
-            let payload = crate::meta::serialization::serialize_meta(&updated)?;
-            plans.push(UpdatePlan::new_write(ctx, key.to_string(), payload)?);
-
-            for ref_id in ref_ids {
-                if let Some(refs) = ctx.value_deserialized::<i64>(&ref_id)? {
-
+                    return Err(MetaError::Internal(format!(
+                        "compact_chunk origin mismatch: {detail}"
+                    )));
                 }
-            }
 
-            Ok((plans, to_delete))
-        })
-        .await
+                if skipped > slices.len() {
+                    return Err(MetaError::Internal(format!(
+                        "compact_chunk skipped {skipped} exceeds slice count {}",
+                        slices.len()
+                    )));
+                }
+
+                let mut updated = Vec::with_capacity(skipped.saturating_add(1));
+                updated.extend_from_slice(&slices[..skipped]);
+                updated.push(new);
+
+                let payload = crate::meta::serialization::serialize_meta(&updated)?;
+                plans.push(UpdatePlan::new_write(ctx, key.to_string(), payload)?);
+
+                for ref_id in ref_ids {
+                    if let Some(refs) = ctx.value_deserialized::<i64>(&ref_id)? {}
+                }
+
+                Ok((plans, to_delete))
+            })
+            .await?;
+
+        Ok(to_delete)
     }
 
     async fn delete_slices(&self, slices: &[SliceDesc]) -> Result<(), MetaError> {
-        let mut builder = TxnBuilder::new();
-
         let keys = slices
             .into_iter()
             .map(|s| Self::etcd_slice_ref_key(s.slice_id))
             .collect::<Vec<_>>();
 
-        builder.add_stage(keys, |ctx| {
+        execute_backoff(&self.client, keys, 10, |ctx| {
             ctx.slots
                 .keys()
                 .map(|k| UpdatePlan::new_delete(ctx, k))
-                .collect::<Result<Vec<_>, MetaError>>()
-        });
+                .collect::<Result<Vec<_>, MetaError>>()?;
+        })
+        .await?;
 
-        builder.execute(&self.client, 10).await
+        Ok(())
     }
 
     // returns the current lock owner for a range on a file.

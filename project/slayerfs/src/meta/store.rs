@@ -283,6 +283,9 @@ pub enum MetaError {
     #[error("continue retry")]
     ContinueRetry,
 
+    #[error("transaction conflict")]
+    TxnConflict,
+
     #[error("error: max retries exceeded")]
     MaxRetriesExceeded,
 
